@@ -1,4 +1,4 @@
 node_modules/
 jobs/
 tmp/
-
+.env.coolify
