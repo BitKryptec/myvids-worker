@@ -20,6 +20,23 @@ const VERIFY_TLS = String(process.env.VERIFY_TLS || "1") !== "0";
 /** @type {Map<string, any>} */
 const jobs = new Map();
 
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function log(level, msg, extra) {
+  const base = `[${nowIso()}] [${level}] ${msg}`;
+  if (extra === undefined) {
+    console.log(base);
+    return;
+  }
+  try {
+    console.log(base, JSON.stringify(extra));
+  } catch {
+    console.log(base, extra);
+  }
+}
+
 function safeError(err) {
   if (!err) return "Unknown error";
   if (typeof err === "string") return err;
@@ -44,10 +61,42 @@ function authMiddleware(req, res, next) {
   if (!WORKER_TOKEN) return next();
   const incoming = (req.get(WORKER_TOKEN_HEADER) || "").trim();
   if (!incoming || incoming !== WORKER_TOKEN) {
+    log("WARN", "Unauthorized request", {
+      method: req.method,
+      path: req.originalUrl,
+      ip: req.ip,
+      hasToken: incoming !== "",
+      tokenHeader: WORKER_TOKEN_HEADER,
+      ua: req.get("user-agent") || "",
+    });
     return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
   next();
 }
+
+app.use((req, res, next) => {
+  const start = Date.now();
+  const rid = crypto.randomUUID().slice(0, 8);
+  req._rid = rid;
+  log("INFO", "REQ IN", {
+    rid,
+    method: req.method,
+    path: req.originalUrl,
+    ip: req.ip,
+    ua: req.get("user-agent") || "",
+    host: req.get("host") || "",
+  });
+  res.on("finish", () => {
+    log("INFO", "REQ OUT", {
+      rid,
+      method: req.method,
+      path: req.originalUrl,
+      status: res.statusCode,
+      ms: Date.now() - start,
+    });
+  });
+  next();
+});
 
 async function ensureDirs() {
   await fsp.mkdir(JOBS_DIR, { recursive: true });
@@ -55,18 +104,21 @@ async function ensureDirs() {
 }
 
 async function downloadSource(url, headers, destFile) {
+  log("INFO", "Download source start", { url });
   const opts = { headers: headers || {} };
   if (!VERIFY_TLS && url.startsWith("https://")) {
     process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
   }
   const resp = await fetch(url, opts);
   if (!resp.ok || !resp.body) {
+    log("ERROR", "Download source failed", { url, status: resp.status });
     throw new Error(`Download source failed (${resp.status})`);
   }
   await fsp.mkdir(path.dirname(destFile), { recursive: true });
   await pipeline(resp.body, fs.createWriteStream(destFile));
   const st = await fsp.stat(destFile);
   if (st.size <= 0) throw new Error("Downloaded source is empty");
+  log("INFO", "Download source done", { url, bytes: st.size });
 }
 
 function parseProgressSec(stderrChunk) {
@@ -121,6 +173,12 @@ function createJob(payload, req) {
     public_base: getPublicBase(req),
   };
   jobs.set(id, job);
+  log("INFO", "Job created", {
+    rid: req._rid,
+    job_id: id,
+    type: job.type,
+    sourceUrl: payload?.source?.url || "",
+  });
   return job;
 }
 
@@ -135,6 +193,11 @@ async function runFfmpegJob(job, payload, req) {
 
     job.status = "running";
     job.updated_at = Math.floor(Date.now() / 1000);
+    log("INFO", "Job running", {
+      rid: req._rid,
+      job_id: job.id,
+      type: job.type,
+    });
 
     await downloadSource(sourceUrl, source.headers || {}, job.tmp_input);
 
@@ -161,6 +224,12 @@ async function runFfmpegJob(job, payload, req) {
     const ff = spawn("ffmpeg", ffArgs, { stdio: ["ignore", "ignore", "pipe"] });
     job.process = ff;
     job.pid = ff.pid || 0;
+    log("INFO", "FFmpeg spawned", {
+      rid: req._rid,
+      job_id: job.id,
+      pid: job.pid,
+      args: ffArgs,
+    });
 
     let stderrTail = "";
     ff.stderr.on("data", (chunk) => {
@@ -172,6 +241,12 @@ async function runFfmpegJob(job, payload, req) {
         if (job.duration_sec > 0) {
           job.progress = Math.max(0, Math.min(1, sec / job.duration_sec));
         }
+        log("DEBUG", "Job progress", {
+          job_id: job.id,
+          progress: job.progress,
+          progress_sec: job.progress_sec,
+          duration_sec: job.duration_sec,
+        });
       }
       job.updated_at = Math.floor(Date.now() / 1000);
     });
@@ -191,6 +266,7 @@ async function runFfmpegJob(job, payload, req) {
 
     if (job.canceled) {
       job.status = "canceled";
+      log("WARN", "Job canceled", { job_id: job.id });
       return;
     }
 
@@ -207,10 +283,20 @@ async function runFfmpegJob(job, payload, req) {
         url: jobPublicArtifactUrl(req, job.id, outputName),
       },
     ];
+    log("INFO", "Job done", {
+      rid: req._rid,
+      job_id: job.id,
+      artifacts: job.artifacts,
+    });
   } catch (err) {
     job.status = job.canceled ? "canceled" : "failed";
     job.error = safeError(err);
     job.updated_at = Math.floor(Date.now() / 1000);
+    log("ERROR", "Job failed", {
+      rid: req._rid,
+      job_id: job.id,
+      error: job.error,
+    });
   } finally {
     try { await fsp.unlink(job.tmp_input); } catch {}
   }
@@ -224,9 +310,11 @@ app.post("/jobs", authMiddleware, async (req, res) => {
   const payload = req.body || {};
   const type = String(payload.type || "");
   if (!["regen", "portrait", "trim"].includes(type)) {
+    log("WARN", "Invalid job type", { rid: req._rid, type });
     return res.status(400).json({ ok: false, error: "Invalid type" });
   }
   if (!payload.source || !payload.source.url) {
+    log("WARN", "Missing source.url", { rid: req._rid });
     return res.status(400).json({ ok: false, error: "source.url is required" });
   }
 
@@ -249,7 +337,10 @@ app.post("/jobs", authMiddleware, async (req, res) => {
 
 app.get("/jobs/:id", authMiddleware, (req, res) => {
   const job = jobs.get(req.params.id);
-  if (!job) return res.status(404).json({ ok: false, error: "Job not found" });
+  if (!job) {
+    log("WARN", "Job not found", { rid: req._rid, job_id: req.params.id });
+    return res.status(404).json({ ok: false, error: "Job not found" });
+  }
   res.json({
     ok: true,
     job_id: job.id,
@@ -268,13 +359,17 @@ app.get("/jobs/:id", authMiddleware, (req, res) => {
 
 app.post("/jobs/:id/cancel", authMiddleware, (req, res) => {
   const job = jobs.get(req.params.id);
-  if (!job) return res.status(404).json({ ok: false, error: "Job not found" });
+  if (!job) {
+    log("WARN", "Cancel job not found", { rid: req._rid, job_id: req.params.id });
+    return res.status(404).json({ ok: false, error: "Job not found" });
+  }
   if (job.status !== "running" && job.status !== "queued") {
     return res.json({ ok: true, job_id: job.id, status: job.status });
   }
   job.canceled = true;
   job.status = "canceled";
   job.updated_at = Math.floor(Date.now() / 1000);
+  log("WARN", "Cancel requested", { rid: req._rid, job_id: job.id, pid: job.pid });
   if (job.process && job.pid) {
     try {
       process.kill(job.pid, "SIGTERM");
@@ -288,21 +383,34 @@ app.post("/jobs/:id/cancel", authMiddleware, (req, res) => {
 
 app.get("/artifacts/:jobId/:file", authMiddleware, async (req, res) => {
   const job = jobs.get(req.params.jobId);
-  if (!job) return res.status(404).json({ ok: false, error: "Job not found" });
+  if (!job) {
+    log("WARN", "Artifact job not found", { rid: req._rid, job_id: req.params.jobId });
+    return res.status(404).json({ ok: false, error: "Job not found" });
+  }
   const fileName = path.basename(req.params.file);
   const abs = path.join(job.output_dir, fileName);
-  if (!abs.startsWith(job.output_dir)) return res.status(400).json({ ok: false, error: "Invalid path" });
-  if (!fs.existsSync(abs)) return res.status(404).json({ ok: false, error: "Artifact not found" });
+  if (!abs.startsWith(job.output_dir)) {
+    log("WARN", "Artifact invalid path", { rid: req._rid, abs, out: job.output_dir });
+    return res.status(400).json({ ok: false, error: "Invalid path" });
+  }
+  if (!fs.existsSync(abs)) {
+    log("WARN", "Artifact not found", { rid: req._rid, abs });
+    return res.status(404).json({ ok: false, error: "Artifact not found" });
+  }
+  log("INFO", "Artifact served", { rid: req._rid, file: abs });
   res.sendFile(abs);
 });
 
 ensureDirs()
   .then(() => {
     app.listen(PORT, () => {
-      console.log(`myVids remote worker running on :${PORT}`);
+      log("INFO", `myVids remote worker running on :${PORT}`, {
+        tokenHeader: WORKER_TOKEN_HEADER,
+        tokenEnabled: WORKER_TOKEN !== "",
+      });
     });
   })
   .catch((err) => {
-    console.error("Failed to start worker:", err);
+    log("ERROR", "Failed to start worker", { error: safeError(err) });
     process.exit(1);
   });
