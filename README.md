@@ -43,7 +43,7 @@ Exemple `POST /jobs`:
 {
   "type": "trim",
   "source": {
-    "url": "https://domain-myvids.com/myVids/index.php?stream=video.mp4",
+    "url": "https://domain-myvids.com/myvids/index.php?stream=video.mp4",
     "headers": {
       "Authorization": "Basic base64..."
     }
