@@ -24,7 +24,7 @@ Variables d'environnement:
 - `PORT` (défaut: `8787`)
 - `WORKER_TOKEN` (recommandé)
 - `WORKER_TOKEN_HEADER` (défaut: `x-worker-token`)
-- `BASE_PUBLIC_URL` (ex: `https://myvids-worker.domain-worker.com`)
+- `BASE_PUBLIC_URL` (ex: `https://myvids-worker-ipv4.domain-worker.com`)
 - `JOBS_DIR` (défaut: `./jobs`)
 - `TMP_DIR` (défaut: `./tmp`)
 - `VERIFY_TLS` (`1` par défaut; `0` pour ignorer TLS en dev uniquement)
