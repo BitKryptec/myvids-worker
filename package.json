@@ -1,0 +1,17 @@
+{
+  "name": "myvids-remote-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Remote FFmpeg worker for myVids",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
